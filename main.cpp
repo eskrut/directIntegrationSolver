@@ -77,9 +77,6 @@ int main(int argc, char ** argv)
     }
     const int numLDown = loadedNodesDown.size(), numLUp = loadedNodesUp.size();
 
-    // Stiffness matrix iteration halper
-    std::unique_ptr<sbfMatrixIterator> iteratorPtr(stiff->createIterator());
-    sbfMatrixIterator *iterator = iteratorPtr.get();
 
     // Time integration loop
     report.createNewProgress("Time integration");
@@ -90,29 +87,35 @@ int main(int argc, char ** argv)
             displ.data(loadedNodesDown[nodeCt], ct) = tmp[ct];
         for(int nodeCt = 0; nodeCt < numLUp; ++nodeCt) for(int ct = 0; ct < 3; ct++)
             displ.data(loadedNodesUp[nodeCt], ct) = tmp[ct]/3;
-#pragma omp parallel for
-        for(int nodeCt = 0; nodeCt < numNodes; nodeCt++) {
-            // Make multiplication of stiffness matrix over displacement vector
-            iterator->setToRow(nodeCt);
-            double *rez = rezKU.data() + nodeCt*3;
-            rez[0] = rez[1] = rez[2] = 0.0;
-            while(iterator->isValid()) {
-                int columnID = iterator->column();
-                double *vectPart = displ.data() + columnID*3;
-                double *block = iterator->data();
-                for(int rowCt = 0; rowCt < 3; ++rowCt)
-                    for(int colCt = 0; colCt < 3; ++colCt)
-                        rez[rowCt] += block[rowCt*3+colCt]*vectPart[colCt];
-                iterator->next();
-            }
-            // Perform finite difference step
-            for(int ct = 0; ct < 3; ct++) {
-                temp=force.data(nodeCt, ct) - rezKU.data(nodeCt, ct) +
-                     a2*mass.data(nodeCt, ct)*displ.data(nodeCt, ct) -
-                     (a0*mass.data(nodeCt, ct) - a1*demp.data(nodeCt, ct))*displ_m1.data(nodeCt, ct);
-                displ_p1.data(nodeCt, ct) = temp/(a0*mass.data(nodeCt, ct) + a1*demp.data(nodeCt, ct));
-            }
-        }
+#pragma omp parallel private(temp)
+        {
+            // Stiffness matrix iteration halper
+            std::unique_ptr<sbfMatrixIterator> iteratorPtr(stiff->createIterator());
+            sbfMatrixIterator *iterator = iteratorPtr.get();
+#pragma omp for
+            for(int nodeCt = 0; nodeCt < numNodes; nodeCt++) {
+                // Make multiplication of stiffness matrix over displacement vector
+                iterator->setToRow(nodeCt);
+                double *rez = rezKU.data() + nodeCt*3;
+                rez[0] = rez[1] = rez[2] = 0.0;
+                while(iterator->isValid()) {
+                    int columnID = iterator->column();
+                    double *vectPart = displ.data() + columnID*3;
+                    double *block = iterator->data();
+                    for(int rowCt = 0; rowCt < 3; ++rowCt)
+                        for(int colCt = 0; colCt < 3; ++colCt)
+                            rez[rowCt] += block[rowCt*3+colCt]*vectPart[colCt];
+                    iterator->next();
+                }
+                // Perform finite difference step
+                for(int ct = 0; ct < 3; ct++) {
+                    temp=force.data(nodeCt, ct) - rezKU.data(nodeCt, ct) +
+                            a2*mass.data(nodeCt, ct)*displ.data(nodeCt, ct) -
+                            (a0*mass.data(nodeCt, ct) - a1*demp.data(nodeCt, ct))*displ_m1.data(nodeCt, ct);
+                    displ_p1.data(nodeCt, ct) = temp/(a0*mass.data(nodeCt, ct) + a1*demp.data(nodeCt, ct));
+                }
+            }//End of #pragma omp for
+        }//End of #pragma omp parallel
 
         // Make output if required
         if(t >= tNextOut) { displ.writeToFile();tNextOut += dtOut;report.updateProgress(t/tStop*100);}
