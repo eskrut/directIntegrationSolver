@@ -8,6 +8,8 @@
 
 namespace po = boost::program_options;
 
+#include <omp.h>
+
 void computeMassDemp(NodesData<double, 3> &mass, NodesData<double, 3> &demp, sbfMesh *mesh, sbfPropertiesSet *propSet, double ksi, bool recalculate);
 void getDispl(const double t, double * displ, double ampX, double freqX, double transT);
 
@@ -88,7 +90,7 @@ int main(int argc, char ** argv)
             displ.data(loadedNodesDown[nodeCt], ct) = tmp[ct];
         for(int nodeCt = 0; nodeCt < numLUp; ++nodeCt) for(int ct = 0; ct < 3; ct++)
             displ.data(loadedNodesUp[nodeCt], ct) = tmp[ct]/3;
-
+#pragma omp parallel for
         for(int nodeCt = 0; nodeCt < numNodes; nodeCt++) {
             // Make multiplication of stiffness matrix over displacement vector
             iterator->setToRow(nodeCt);
