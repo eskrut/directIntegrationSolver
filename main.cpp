@@ -49,7 +49,9 @@ int main(int argc, char ** argv)
     // Create appropriate mesh
     std::unique_ptr<sbfMesh> meshPtr(new sbfMesh);
     if( recreateMesh || meshPtr->readMeshFromFiles() ){
+        sbfTimer<> timer; timer.start();
         meshPtr.reset(createMesh(discretParam));
+        timer.stop(); report("Mesh recreated in", timer.timeSpanStr());
         if ( makeNodesRenumbering ) meshPtr->optimizeNodesNumbering();
         meshPtr->writeMeshToFiles();
     }
