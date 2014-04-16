@@ -80,18 +80,22 @@ int main(int argc, char ** argv)
 
     // Time integration loop
     report.createNewProgress("Time integration");
-    while( t < tStop ) { // Time loop
-        // Update displacements of kinematically loaded nodes
-        double tmp[3], temp; getDispl(t, tmp, ampX, freqX, transT);
-        for(int nodeCt = 0; nodeCt < numLDown; ++nodeCt) for(int ct = 0; ct < 3; ct++)
-            displ.data(loadedNodesDown[nodeCt], ct) = tmp[ct];
-        for(int nodeCt = 0; nodeCt < numLUp; ++nodeCt) for(int ct = 0; ct < 3; ct++)
-            displ.data(loadedNodesUp[nodeCt], ct) = tmp[ct]/3;
-#pragma omp parallel private(temp)
-        {
-            // Stiffness matrix iteration halper
-            std::unique_ptr<sbfMatrixIterator> iteratorPtr(stiff->createIterator());
-            sbfMatrixIterator *iterator = iteratorPtr.get();
+    double tmp[3];
+#pragma omp parallel
+    {
+        // Stiffness matrix iteration halper
+        std::unique_ptr<sbfMatrixIterator> iteratorPtr(stiff->createIterator());
+        sbfMatrixIterator *iterator = iteratorPtr.get();
+        while( t < tStop ) { // Time loop
+            // Update displacements of kinematically loaded nodes
+#pragma omp master
+            getDispl(t, tmp, ampX, freqX, transT);
+#pragma omp for nowait
+            for(int nodeCt = 0; nodeCt < numLDown; ++nodeCt) for(int ct = 0; ct < 3; ct++)
+                displ.data(loadedNodesDown[nodeCt], ct) = tmp[ct];
+#pragma omp for
+            for(int nodeCt = 0; nodeCt < numLUp; ++nodeCt) for(int ct = 0; ct < 3; ct++)
+                displ.data(loadedNodesUp[nodeCt], ct) = tmp[ct]/3;
 #pragma omp for
             for(int nodeCt = 0; nodeCt < numNodes; nodeCt++) {
                 // Make multiplication of stiffness matrix over displacement vector
@@ -109,20 +113,30 @@ int main(int argc, char ** argv)
                 }
                 // Perform finite difference step
                 for(int ct = 0; ct < 3; ct++) {
-                    temp=force.data(nodeCt, ct) - rezKU.data(nodeCt, ct) +
-                            a2*mass.data(nodeCt, ct)*displ.data(nodeCt, ct) -
-                            (a0*mass.data(nodeCt, ct) - a1*demp.data(nodeCt, ct))*displ_m1.data(nodeCt, ct);
-                    displ_p1.data(nodeCt, ct) = temp/(a0*mass.data(nodeCt, ct) + a1*demp.data(nodeCt, ct));
+                    double temp = force.data()[3*nodeCt+ct] - rezKU.data()[3*nodeCt+ct] +
+                            a2*mass.data()[3*nodeCt+ct]*displ.data()[3*nodeCt+ct] -
+                            (a0*mass.data()[3*nodeCt+ct] - a1*demp.data()[3*nodeCt+ct])
+                            *displ_m1.data()[3*nodeCt+ct];
+                    displ_p1.data()[3*nodeCt+ct] = temp/(a0*mass.data()[3*nodeCt+ct] + a1*demp.data()[3*nodeCt+ct]);
                 }
             }//End of #pragma omp for
-        }//End of #pragma omp parallel
-
-        // Make output if required
-        if(t >= tNextOut) { displ.writeToFile();tNextOut += dtOut;report.updateProgress(t/tStop*100);}
-        // Prepere for next step
-        t += dt;
-        displ_m1.copyData(displ); displ.copyData(displ_p1);
-    } // End time loop
+#pragma omp master
+            {
+                // Make output if required
+                if(t >= tNextOut) { displ.writeToFile();tNextOut += dtOut;report.updateProgress(t/tStop*100);}
+                // Prepere for next step
+                t += dt;
+            }//End of #pragma omp master
+#pragma omp for
+            for(int nodeCt = 0; nodeCt < numNodes; nodeCt++) {
+                // Perform finite difference step
+                for(int ct = 0; ct < 3; ct++) {
+                    displ_m1.data()[3*nodeCt+ct] = displ.data()[3*nodeCt+ct];
+                    displ.data()[3*nodeCt+ct] = displ_p1.data()[3*nodeCt+ct];
+                }
+            }//End of #pragma omp for
+        } // End time loop
+    }//End of #pragma omp parallel
     report.finalizeProgress();
 
     return 0;
