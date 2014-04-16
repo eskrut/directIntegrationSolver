@@ -8,6 +8,9 @@
 
 namespace po = boost::program_options;
 
+#include <chrono>
+using Clock = std::chrono::high_resolution_clock;
+
 void computeMassDemp(NodesData<double, 3> &mass, NodesData<double, 3> &demp, sbfMesh *mesh, sbfPropertiesSet *propSet, double ksi, bool recalculate);
 void getDispl(const double t, double * displ, double ampX, double freqX, double transT);
 
@@ -81,7 +84,9 @@ int main(int argc, char ** argv)
 
     // Time integration loop
     report.createNewProgress("Time integration");
+    std::chrono::nanoseconds period1(0), period2(0), period3(0), period4(0);
     while( t < tStop ) { // Time loop
+        auto timePoint_0 = Clock::now();
         // Update displacements of kinematically loaded nodes
         double tmp[3], temp; getDispl(t, tmp, ampX, freqX, transT);
         for(int nodeCt = 0; nodeCt < numLDown; ++nodeCt) for(int ct = 0; ct < 3; ct++)
@@ -89,6 +94,7 @@ int main(int argc, char ** argv)
         for(int nodeCt = 0; nodeCt < numLUp; ++nodeCt) for(int ct = 0; ct < 3; ct++)
             displ.data(loadedNodesUp[nodeCt], ct) = tmp[ct]/3;
 
+        auto timePoint_1 = Clock::now();
         for(int nodeCt = 0; nodeCt < numNodes; nodeCt++) {
             // Make multiplication of stiffness matrix over displacement vector
             iterator->setToRow(nodeCt);
@@ -103,6 +109,9 @@ int main(int argc, char ** argv)
                         rez[rowCt] += block[rowCt*3+colCt]*vectPart[colCt];
                 iterator->next();
             }
+        }
+        auto timePoint_2 = Clock::now();
+        for(int nodeCt = 0; nodeCt < numNodes; nodeCt++) {
             // Perform finite difference step
             for(int ct = 0; ct < 3; ct++) {
                 temp=force.data(nodeCt, ct) - rezKU.data(nodeCt, ct) +
@@ -112,13 +121,24 @@ int main(int argc, char ** argv)
             }
         }
 
+        auto timePoint_3 = Clock::now();
         // Make output if required
         if(t >= tNextOut) { displ.writeToFile();tNextOut += dtOut;report.updateProgress(t/tStop*100);}
         // Prepere for next step
         t += dt;
         displ_m1.copyData(displ); displ.copyData(displ_p1);
+        auto timePoint_4 = Clock::now();
+        period1 += std::chrono::duration_cast<std::chrono::nanoseconds>(timePoint_1 - timePoint_0);
+        period2 += std::chrono::duration_cast<std::chrono::nanoseconds>(timePoint_2 - timePoint_1);
+        period3 += std::chrono::duration_cast<std::chrono::nanoseconds>(timePoint_3 - timePoint_2);
+        period4 += std::chrono::duration_cast<std::chrono::nanoseconds>(timePoint_4 - timePoint_3);
     } // End time loop
     report.finalizeProgress();
+
+    report("Prepare part time           : ", period1.count());
+    report("Matrix multiplication time  : ", period2.count());
+    report("Finite difference step time : ", period3.count());
+    report("Finilizing part time        : ", period4.count());
 
     return 0;
 } //End main
