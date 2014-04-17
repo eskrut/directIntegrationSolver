@@ -10,6 +10,10 @@ namespace po = boost::program_options;
 
 #include <mpi.h>
 
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+
 void computeMassDemp(NodesData<double, 3> &mass, NodesData<double, 3> &demp, sbfMesh *mesh, sbfPropertiesSet *propSet, double ksi, bool recalculate);
 void getDispl(const double t, double * displ, double ampX, double freqX, double transT);
 
@@ -19,6 +23,7 @@ int main(int argc, char ** argv)
     double t, tStop, dt, dtOut, tNextOut, transT;
     double ampX, freqX, ksi;
     bool recreateMesh = false;
+    int numThreads;
     bool makeNodesRenumbering = true;
     po::options_description desc("Program options");
     desc.add_options()
@@ -33,6 +38,7 @@ int main(int argc, char ** argv)
     ("discretParam,d", po::value<int>(&discretParam)->default_value(2), "discretisation parameter")
     ("recreateMesh,m", "recreate mesh")
     ("no-nr", "do not optimize nodes numbering")
+    ("nt", po::value<int>(&numThreads)->default_value(8), "number of worker threads")
     ;
     po::variables_map vm;
     po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -110,13 +116,73 @@ int main(int argc, char ** argv)
     }
     const int numLDown = loadedNodesDown.size(), numLUp = loadedNodesUp.size();
 
-    // Stiffness matrix iteration halper
-    std::unique_ptr<sbfMatrixIterator> iteratorPtr(stiff->createIterator());
-    sbfMatrixIterator *iterator = iteratorPtr.get();
+    struct event{
+        std::mutex mtx;
+        std::condition_variable cond;
+        bool state{false};
+        void wait() {
+            std::unique_lock<std::mutex> lock(mtx);
+            while(!state) cond.wait(lock);
+            state = false;
+        }
+        void set() {
+            std::unique_lock<std::mutex> lock(mtx);
+            state = true;
+            cond.notify_one();
+        }
+    };
 
-    // Time integration loop
+    std::vector<event*> eventsStart, eventsStop;
+    std::vector<std::thread> threads; threads.resize(numThreads);
+
+    auto procFunc = [&](int start, int stop, event *evStart, event *evStop){
+        std::unique_ptr<sbfMatrixIterator> iteratorPtr(stiff->createIterator());
+        sbfMatrixIterator *iterator = iteratorPtr.get();
+        evStop->set();
+        while(true){
+            evStart->wait();
+            for(int nodeCt = start; nodeCt < stop; nodeCt++) {
+                // Make multiplication of stiffness matrix over displacement vector
+                iterator->setToRow(nodeCt);
+                double *rez = rezKU.data() + nodeCt*3;
+                rez[0] = rez[1] = rez[2] = 0.0;
+                while(iterator->isValid()) {
+                    int columnID = iterator->column();
+                    double *vectPart = displ.data() + columnID*3;
+                    double *block = iterator->data();
+                    for(int rowCt = 0; rowCt < 3; ++rowCt)
+                        for(int colCt = 0; colCt < 3; ++colCt)
+                            rez[rowCt] += block[rowCt*3+colCt]*vectPart[colCt];
+                    iterator->next();
+                }
+                // Perform finite difference step
+                for(int ct = 0; ct < 3; ct++) {
+                    double temp = force.data()[3*nodeCt+ct] - rezKU.data()[3*nodeCt+ct] +
+                            a2*mass.data()[3*nodeCt+ct]*displ.data()[3*nodeCt+ct] -
+                            (a0*mass.data()[3*nodeCt+ct] - a1*demp.data()[3*nodeCt+ct])
+                            *displ_m1.data()[3*nodeCt+ct];
+                    reduceBuf.data()[3*nodeCt+ct] = temp/(a0*mass.data()[3*nodeCt+ct] + a1*demp.data()[3*nodeCt+ct]);
+                }
+            }
+            evStop->set();
+        }
+    };
+
     int nodeStart = numNodes/numProcs*procID;
     int nodeStop = procID != numProcs - 1 ? numNodes/numProcs*(procID+1) : numNodes;
+
+    for(int ct = 0; ct < numThreads; ct++) {
+        eventsStart.push_back(new event);
+        eventsStop.push_back(new event);
+        int threadStartNode = nodeStart + (nodeStop - nodeStart)/numThreads*ct;
+        int threadStopNode = nodeStart + (nodeStop - nodeStart)/numThreads*(ct+1);
+        if(ct == numThreads-1) threadStopNode = nodeStop;
+        threads[ct] = std::thread(std::bind(procFunc, threadStartNode, threadStopNode, eventsStart[ct], eventsStop[ct]));
+        threads[ct].detach();
+    }
+    for(auto ev : eventsStop) ev->wait();
+
+    // Time integration loop
     if ( procID == 0 ) report.createNewProgress("Time integration");
     while( t < tStop ) { // Time loop
         // Update displacements of kinematically loaded nodes
@@ -129,29 +195,8 @@ int main(int argc, char ** argv)
         MPI_Bcast(displ.data(), numNodes*3, MPI_DOUBLE, 0, MPI_COMM_WORLD);
         rezKU.null();
         reduceBuf.null();
-        for(int nodeCt = nodeStart; nodeCt < nodeStop; nodeCt++) {
-            // Make multiplication of stiffness matrix over displacement vector
-            iterator->setToRow(nodeCt);
-            double *rez = rezKU.data() + nodeCt*3;
-            rez[0] = rez[1] = rez[2] = 0.0;
-            while(iterator->isValid()) {
-                int columnID = iterator->column();
-                double *vectPart = displ.data() + columnID*3;
-                double *block = iterator->data();
-                for(int rowCt = 0; rowCt < 3; ++rowCt)
-                    for(int colCt = 0; colCt < 3; ++colCt)
-                        rez[rowCt] += block[rowCt*3+colCt]*vectPart[colCt];
-                iterator->next();
-            }
-            // Perform finite difference step
-            for(int ct = 0; ct < 3; ct++) {
-                double temp = force.data()[3*nodeCt+ct] - rezKU.data()[3*nodeCt+ct] +
-                        a2*mass.data()[3*nodeCt+ct]*displ.data()[3*nodeCt+ct] -
-                        (a0*mass.data()[3*nodeCt+ct] - a1*demp.data()[3*nodeCt+ct])
-                        *displ_m1.data()[3*nodeCt+ct];
-                reduceBuf.data()[3*nodeCt+ct] = temp/(a0*mass.data()[3*nodeCt+ct] + a1*demp.data()[3*nodeCt+ct]);
-            }
-        }
+        for(auto ev : eventsStart) ev->set();
+        for(auto ev : eventsStop) ev->wait();
         MPI_Allreduce(reduceBuf.data(), displ_p1.data(), numNodes*3, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
 
         // Make output if required
