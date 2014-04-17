@@ -8,6 +8,8 @@
 
 namespace po = boost::program_options;
 
+#include <mpi.h>
+
 void computeMassDemp(NodesData<double, 3> &mass, NodesData<double, 3> &demp, sbfMesh *mesh, sbfPropertiesSet *propSet, double ksi, bool recalculate);
 void getDispl(const double t, double * displ, double ampX, double freqX, double transT);
 
@@ -44,34 +46,67 @@ int main(int argc, char ** argv)
     double a0, a1, a2;
     a0 = 1.0/(dt*dt); a1 = 1.0/(2.0*dt); a2 = 2.0*a0;
 
+    MPI_Init(&argc, &argv);
+    int procID, numProcs;
+    MPI_Comm_size(MPI_COMM_WORLD, &numProcs);
+    MPI_Comm_rank(MPI_COMM_WORLD, &procID);
+
     // Create appropriate mesh
     std::unique_ptr<sbfMesh> meshPtr(new sbfMesh);
-    if( recreateMesh || meshPtr->readMeshFromFiles() ){
+    if ( procID == 0 ) if( recreateMesh || meshPtr->readMeshFromFiles() ){
         meshPtr.reset(createMesh(discretParam));
         if ( makeNodesRenumbering ) meshPtr->optimizeNodesNumbering();
         meshPtr->writeMeshToFiles();
     }
     sbfMesh *mesh = meshPtr.get();
     const int numNodes = mesh->numNodes();
+    MPI_Bcast(const_cast<int*>(&numNodes), 1, MPI_INT, 0, MPI_COMM_WORLD);
 
     // Create and compute stiffness matrix
-    std::unique_ptr<sbfStiffMatrixBlock3x3> stiffPtr(createStiffMatrix(mesh, recreateMesh));
+    std::unique_ptr<sbfStiffMatrixBlock3x3> stiffPtr(new sbfStiffMatrixBlock3x3);
+    int numBlocks[2], type;
+    if ( procID == 0 ) {
+        stiffPtr.reset(createStiffMatrix(mesh, recreateMesh));
+        numBlocks[0] = stiffPtr->numBlocks();
+        numBlocks[1] = stiffPtr->numBlocksAlter();
+        type = static_cast<int>(stiffPtr->type());
+    }
+    MPI_Bcast(numBlocks, 2, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&type, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if ( procID != 0 ) {
+        stiffPtr.reset(new sbfStiffMatrixBlock3x3(numBlocks[0], numNodes, numBlocks[1]));
+        stiffPtr->setType(static_cast<MatrixType>(type));
+    }
     sbfStiffMatrixBlock3x3 *stiff = stiffPtr.get();
+    MPI_Bcast(const_cast<int *>(stiff->indData()), numBlocks[0], MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(const_cast<int *>(stiff->shiftIndData()), numNodes+1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (numBlocks[1]) {
+        MPI_Bcast(const_cast<int *>(stiff->indDataAlter()), numBlocks[1], MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Bcast(const_cast<int *>(stiff->shiftIndDataAlter()), numNodes+1, MPI_INT, 0, MPI_COMM_WORLD);
+    }
+    MPI_Bcast(const_cast<double *>(stiff->data()), numBlocks[0]*9, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    if ( procID != 0 ) stiff->updataAlterPtr();
 
     // Create nodes data storages
-    NodesData<double, 3> displ_m1(mesh), displ("displ", mesh), displ_p1(mesh);
-    NodesData<double, 3> force(mesh), mass("mass", mesh), demp(mesh), rezKU(mesh);
+    NodesData<double, 3> displ_m1(numNodes), displ("displ", numNodes), displ_p1(numNodes);
+    NodesData<double, 3> force(numNodes), mass("mass", numNodes), demp(numNodes), rezKU(numNodes);
     mass.null(); force.null(); demp.null(); displ_m1.null(); displ.null();
 
+    NodesData<double, 3> reduceBuf("reduceBuf", numNodes);
+
     // Fill mass and demping arrays
-    computeMassDemp(mass, demp, mesh, stiff->propSet(), ksi, recreateMesh);
+    if ( procID == 0 ) computeMassDemp(mass, demp, mesh, stiff->propSet(), ksi, recreateMesh);
+    MPI_Bcast(mass.data(), numNodes*3, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Bcast(demp.data(), numNodes*3, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
     // Get indexes of kinematic loaded nodes
     std::vector<int> loadedNodesDown, loadedNodesUp;
     double maxY = mesh->maxY();
-    for(int ct = 0; ct < numNodes; ct++){
-        if( std::fabs(mesh->node(ct).y()) < 1e-5) loadedNodesDown.push_back(ct);
-        if( std::fabs(mesh->node(ct).y() - maxY) < 1e-5 ) loadedNodesUp.push_back(ct);
+    if ( procID == 0 ) {
+        for(int ct = 0; ct < numNodes; ct++){
+            if( std::fabs(mesh->node(ct).y()) < 1e-5) loadedNodesDown.push_back(ct);
+            if( std::fabs(mesh->node(ct).y() - maxY) < 1e-5 ) loadedNodesUp.push_back(ct);
+        }
     }
     const int numLDown = loadedNodesDown.size(), numLUp = loadedNodesUp.size();
 
@@ -80,7 +115,9 @@ int main(int argc, char ** argv)
     sbfMatrixIterator *iterator = iteratorPtr.get();
 
     // Time integration loop
-    report.createNewProgress("Time integration");
+    int nodeStart = numNodes/numProcs*procID;
+    int nodeStop = procID != numProcs - 1 ? numNodes/numProcs*(procID+1) : numNodes;
+    if ( procID == 0 ) report.createNewProgress("Time integration");
     while( t < tStop ) { // Time loop
         // Update displacements of kinematically loaded nodes
         double tmp[3], temp; getDispl(t, tmp, ampX, freqX, transT);
@@ -89,7 +126,10 @@ int main(int argc, char ** argv)
         for(int nodeCt = 0; nodeCt < numLUp; ++nodeCt) for(int ct = 0; ct < 3; ct++)
             displ.data(loadedNodesUp[nodeCt], ct) = tmp[ct]/3;
 
-        for(int nodeCt = 0; nodeCt < numNodes; nodeCt++) {
+        MPI_Bcast(displ.data(), numNodes*3, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        rezKU.null();
+        reduceBuf.null();
+        for(int nodeCt = nodeStart; nodeCt < nodeStop; nodeCt++) {
             // Make multiplication of stiffness matrix over displacement vector
             iterator->setToRow(nodeCt);
             double *rez = rezKU.data() + nodeCt*3;
@@ -105,20 +145,24 @@ int main(int argc, char ** argv)
             }
             // Perform finite difference step
             for(int ct = 0; ct < 3; ct++) {
-                temp=force.data(nodeCt, ct) - rezKU.data(nodeCt, ct) +
-                     a2*mass.data(nodeCt, ct)*displ.data(nodeCt, ct) -
-                     (a0*mass.data(nodeCt, ct) - a1*demp.data(nodeCt, ct))*displ_m1.data(nodeCt, ct);
-                displ_p1.data(nodeCt, ct) = temp/(a0*mass.data(nodeCt, ct) + a1*demp.data(nodeCt, ct));
+                double temp = force.data()[3*nodeCt+ct] - rezKU.data()[3*nodeCt+ct] +
+                        a2*mass.data()[3*nodeCt+ct]*displ.data()[3*nodeCt+ct] -
+                        (a0*mass.data()[3*nodeCt+ct] - a1*demp.data()[3*nodeCt+ct])
+                        *displ_m1.data()[3*nodeCt+ct];
+                reduceBuf.data()[3*nodeCt+ct] = temp/(a0*mass.data()[3*nodeCt+ct] + a1*demp.data()[3*nodeCt+ct]);
             }
         }
+        MPI_Allreduce(reduceBuf.data(), displ_p1.data(), numNodes*3, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
 
         // Make output if required
-        if(t >= tNextOut) { displ.writeToFile();tNextOut += dtOut;report.updateProgress(t/tStop*100);}
+        if ( procID == 0 ) if(t >= tNextOut) { displ.writeToFile();tNextOut += dtOut;report.updateProgress(t/tStop*100);}
         // Prepere for next step
         t += dt;
         displ_m1.copyData(displ); displ.copyData(displ_p1);
     } // End time loop
-    report.finalizeProgress();
+    if ( procID == 0 ) report.finalizeProgress();
+
+    MPI_Finalize();
 
     return 0;
 } //End main
