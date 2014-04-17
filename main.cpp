@@ -9,6 +9,8 @@
 namespace po = boost::program_options;
 
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 
 void computeMassDemp(NodesData<double, 3> &mass, NodesData<double, 3> &demp, sbfMesh *mesh, sbfPropertiesSet *propSet, double ksi, bool recalculate);
 void getDispl(const double t, double * displ, double ampX, double freqX, double transT);
@@ -79,19 +81,31 @@ int main(int argc, char ** argv)
     }
     const int numLDown = loadedNodesDown.size(), numLUp = loadedNodesUp.size();
 
-    // Time integration loop
-    report.createNewProgress("Time integration");
-    while( t < tStop ) { // Time loop
-        // Update displacements of kinematically loaded nodes
-        double tmp[3], temp; getDispl(t, tmp, ampX, freqX, transT);
-        for(int nodeCt = 0; nodeCt < numLDown; ++nodeCt) for(int ct = 0; ct < 3; ct++)
-            displ.data(loadedNodesDown[nodeCt], ct) = tmp[ct];
-        for(int nodeCt = 0; nodeCt < numLUp; ++nodeCt) for(int ct = 0; ct < 3; ct++)
-            displ.data(loadedNodesUp[nodeCt], ct) = tmp[ct]/3;
+    struct event{
+        std::mutex mtx;
+        std::condition_variable cond;
+        bool state{false};
+        void wait() {
+            std::unique_lock<std::mutex> lock(mtx);
+            while(!state) cond.wait(lock);
+            state = false;
+        }
+        void set() {
+            std::unique_lock<std::mutex> lock(mtx);
+            state = true;
+            cond.notify_one();
+        }
+    };
 
-        auto procFunc = [&](int start, int stop){
-            std::unique_ptr<sbfMatrixIterator> iteratorPtr(stiff->createIterator());
-            sbfMatrixIterator *iterator = iteratorPtr.get();
+    std::vector<event*> eventsStart, eventsStop;
+    std::vector<std::thread> threads; threads.resize(numThreads);
+
+    auto procFunc = [&](int start, int stop, event *evStart, event *evStop){
+        std::unique_ptr<sbfMatrixIterator> iteratorPtr(stiff->createIterator());
+        sbfMatrixIterator *iterator = iteratorPtr.get();
+        evStop->set();
+        while(true){
+            evStart->wait();
             for(int nodeCt = start; nodeCt < stop; nodeCt++) {
                 // Make multiplication of stiffness matrix over displacement vector
                 iterator->setToRow(nodeCt);
@@ -108,16 +122,37 @@ int main(int argc, char ** argv)
                 }
                 // Perform finite difference step
                 for(int ct = 0; ct < 3; ct++) {
-                    temp=force.data(nodeCt, ct) - rezKU.data(nodeCt, ct) +
-                            a2*mass.data(nodeCt, ct)*displ.data(nodeCt, ct) -
-                            (a0*mass.data(nodeCt, ct) - a1*demp.data(nodeCt, ct))*displ_m1.data(nodeCt, ct);
-                    displ_p1.data(nodeCt, ct) = temp/(a0*mass.data(nodeCt, ct) + a1*demp.data(nodeCt, ct));
+                    double temp = force.data()[3*nodeCt+ct] - rezKU.data()[3*nodeCt+ct] +
+                            a2*mass.data()[3*nodeCt+ct]*displ.data()[3*nodeCt+ct] -
+                            (a0*mass.data()[3*nodeCt+ct] - a1*demp.data()[3*nodeCt+ct])
+                            *displ_m1.data()[3*nodeCt+ct];
+                    displ_p1.data()[3*nodeCt+ct] = temp/(a0*mass.data()[3*nodeCt+ct] + a1*demp.data()[3*nodeCt+ct]);
                 }
             }
-        };
-        std::vector<std::thread> threads; threads.resize(numThreads);
-        for(int ct = 0; ct < numThreads; ct++) threads[ct] = std::thread(std::bind(procFunc, numNodes/numThreads*ct, ct != (numThreads-1) ? numNodes/numThreads*(ct+1) : numNodes));
-        for(auto & th : threads) th.join();
+            evStop->set();
+        }
+    };
+
+    for(int ct = 0; ct < numThreads; ct++) {
+        eventsStart.push_back(new event);
+        eventsStop.push_back(new event);
+        threads[ct] = std::thread(std::bind(procFunc, numNodes/numThreads*ct, ct != (numThreads-1) ? numNodes/numThreads*(ct+1) : numNodes, eventsStart[ct], eventsStop[ct]));
+        threads[ct].detach();
+    }
+    for(auto ev : eventsStop) ev->wait();
+
+    // Time integration loop
+    report.createNewProgress("Time integration");
+    while( t < tStop ) { // Time loop
+        // Update displacements of kinematically loaded nodes
+        double tmp[3], temp; getDispl(t, tmp, ampX, freqX, transT);
+        for(int nodeCt = 0; nodeCt < numLDown; ++nodeCt) for(int ct = 0; ct < 3; ct++)
+            displ.data(loadedNodesDown[nodeCt], ct) = tmp[ct];
+        for(int nodeCt = 0; nodeCt < numLUp; ++nodeCt) for(int ct = 0; ct < 3; ct++)
+            displ.data(loadedNodesUp[nodeCt], ct) = tmp[ct]/3;
+
+        for(auto ev : eventsStart) ev->set();
+        for(auto ev : eventsStop) ev->wait();
 
         // Make output if required
         if(t >= tNextOut) { displ.writeToFile();tNextOut += dtOut;report.updateProgress(t/tStop*100);}
