@@ -8,6 +8,8 @@
 
 namespace po = boost::program_options;
 
+#include <thread>
+
 void computeMassDemp(NodesData<double, 3> &mass, NodesData<double, 3> &demp, sbfMesh *mesh, sbfPropertiesSet *propSet, double ksi, bool recalculate);
 void getDispl(const double t, double * displ, double ampX, double freqX, double transT);
 
@@ -17,6 +19,7 @@ int main(int argc, char ** argv)
     double t, tStop, dt, dtOut, tNextOut, transT;
     double ampX, freqX, ksi;
     bool recreateMesh = false;
+    int numThreads;
     bool makeNodesRenumbering = true;
     po::options_description desc("Program options");
     desc.add_options()
@@ -31,6 +34,7 @@ int main(int argc, char ** argv)
     ("discretParam,d", po::value<int>(&discretParam)->default_value(2), "discretisation parameter")
     ("recreateMesh,m", "recreate mesh")
     ("no-nr", "do not optimize nodes numbering")
+    ("nt", po::value<int>(&numThreads)->default_value(8), "number of worker threads")
     ;
     po::variables_map vm;
     po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -75,10 +79,6 @@ int main(int argc, char ** argv)
     }
     const int numLDown = loadedNodesDown.size(), numLUp = loadedNodesUp.size();
 
-    // Stiffness matrix iteration halper
-    std::unique_ptr<sbfMatrixIterator> iteratorPtr(stiff->createIterator());
-    sbfMatrixIterator *iterator = iteratorPtr.get();
-
     // Time integration loop
     report.createNewProgress("Time integration");
     while( t < tStop ) { // Time loop
@@ -89,28 +89,35 @@ int main(int argc, char ** argv)
         for(int nodeCt = 0; nodeCt < numLUp; ++nodeCt) for(int ct = 0; ct < 3; ct++)
             displ.data(loadedNodesUp[nodeCt], ct) = tmp[ct]/3;
 
-        for(int nodeCt = 0; nodeCt < numNodes; nodeCt++) {
-            // Make multiplication of stiffness matrix over displacement vector
-            iterator->setToRow(nodeCt);
-            double *rez = rezKU.data() + nodeCt*3;
-            rez[0] = rez[1] = rez[2] = 0.0;
-            while(iterator->isValid()) {
-                int columnID = iterator->column();
-                double *vectPart = displ.data() + columnID*3;
-                double *block = iterator->data();
-                for(int rowCt = 0; rowCt < 3; ++rowCt)
-                    for(int colCt = 0; colCt < 3; ++colCt)
-                        rez[rowCt] += block[rowCt*3+colCt]*vectPart[colCt];
-                iterator->next();
+        auto procFunc = [&](int start, int stop){
+            std::unique_ptr<sbfMatrixIterator> iteratorPtr(stiff->createIterator());
+            sbfMatrixIterator *iterator = iteratorPtr.get();
+            for(int nodeCt = start; nodeCt < stop; nodeCt++) {
+                // Make multiplication of stiffness matrix over displacement vector
+                iterator->setToRow(nodeCt);
+                double *rez = rezKU.data() + nodeCt*3;
+                rez[0] = rez[1] = rez[2] = 0.0;
+                while(iterator->isValid()) {
+                    int columnID = iterator->column();
+                    double *vectPart = displ.data() + columnID*3;
+                    double *block = iterator->data();
+                    for(int rowCt = 0; rowCt < 3; ++rowCt)
+                        for(int colCt = 0; colCt < 3; ++colCt)
+                            rez[rowCt] += block[rowCt*3+colCt]*vectPart[colCt];
+                    iterator->next();
+                }
+                // Perform finite difference step
+                for(int ct = 0; ct < 3; ct++) {
+                    temp=force.data(nodeCt, ct) - rezKU.data(nodeCt, ct) +
+                            a2*mass.data(nodeCt, ct)*displ.data(nodeCt, ct) -
+                            (a0*mass.data(nodeCt, ct) - a1*demp.data(nodeCt, ct))*displ_m1.data(nodeCt, ct);
+                    displ_p1.data(nodeCt, ct) = temp/(a0*mass.data(nodeCt, ct) + a1*demp.data(nodeCt, ct));
+                }
             }
-            // Perform finite difference step
-            for(int ct = 0; ct < 3; ct++) {
-                temp=force.data(nodeCt, ct) - rezKU.data(nodeCt, ct) +
-                     a2*mass.data(nodeCt, ct)*displ.data(nodeCt, ct) -
-                     (a0*mass.data(nodeCt, ct) - a1*demp.data(nodeCt, ct))*displ_m1.data(nodeCt, ct);
-                displ_p1.data(nodeCt, ct) = temp/(a0*mass.data(nodeCt, ct) + a1*demp.data(nodeCt, ct));
-            }
-        }
+        };
+        std::vector<std::thread> threads; threads.resize(numThreads);
+        for(int ct = 0; ct < numThreads; ct++) threads[ct] = std::thread(std::bind(procFunc, numNodes/numThreads*ct, ct != (numThreads-1) ? numNodes/numThreads*(ct+1) : numNodes));
+        for(auto & th : threads) th.join();
 
         // Make output if required
         if(t >= tNextOut) { displ.writeToFile();tNextOut += dtOut;report.updateProgress(t/tStop*100);}
